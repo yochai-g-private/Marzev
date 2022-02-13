@@ -94,7 +94,8 @@ static LevelInput				_bottom_level(_bottom_level_sensor),
 static DigitalObserver			bottom_level_observer(_bottom_level),
 								top_level_observer	 (_top_level);
 
+//--------------------------------------------------------------
 void UpdateSensorsState()
 {
-    
+
 }
