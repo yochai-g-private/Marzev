@@ -6,19 +6,12 @@
 
 #include "main.h"
 
-State gbl_state = { 
-        STARTUP, 
-        NOT_SIGNALED,
-        false };
+State gbl_state;
 
 #include "RedGreenLed.h"
 #include "IOutput.h"
 #include "Toggler.h"
-
-#if 0
-#include "Timer.h"
 #include "MicroController.h"
-#endif
 
 //-----------------------------------------------------
 //	OUTPUT elements
@@ -29,42 +22,24 @@ static DigitalOutputPin			warning_led(WARNING_LED_PIN);
 static RedGreenLed				led(RED_LED_PIN, GREEN_LED_PIN);
 static DigitalOutputPin			pump(POMP_RELAY_PIN);
 
-//static Toggler					warning_toggler;	// used to toggle the warning led
-
 //-----------------------------------------------------
 //	Other...
 //-----------------------------------------------------
 
-#if 0
-static Timer					pumping_timer;		// used to start or stop the pump
-static Timer					drain_timer;		// used to drain after the pump was stopped
-unsigned long					drain_timer_delay_hours = 0;
-static Toggler					toggler;			// used to show the pumping state, as follows: 
-													// STOPPED			: GREEN led			freq.=300/15000 ms
-													// DELAYED			: RED led			freq.=500/10000 ms
-													// PUMPING			: pumping_signal	(RED led + buzzer)
-													//						Bottom	:		freq.=1/5 s
-													//						Top		:		freq.=1/2 s
-													// SENSOR FAILURE	: pumping_signal	freq.=500 ms, NOT PUMPING
+#define DECLARE_TIMER_NAME(name)    static const char name[] = #name
 
-class Pumping : public IDigitalOutput
-{
-	bool Set(bool value)
-	{
-		if(value)		led.SetRed();
-		else            led.SetOff();
-		return buzzer.Set(value);
-	}
+static Timer                pump_activity_signal_timer;
 
-	bool Get()	const
-	{
-		return buzzer.Get();
-	}
-}	pumping_signal;
-#endif
+static Timer                last_drain_timer;
+DECLARE_TIMER_NAME(LAST_DRAIN);
+
+static Timer                simulation_timer;
+DECLARE_TIMER_NAME(SIMULATION);
 
 DigitalOutputPin			BuiltinLed(LED_BUILTIN);
-Toggler						BuiltinLedToggler;
+static Toggler				BuiltinLedToggler;
+static Toggler				WarningLedToggler;	// used to toggle the warning led
+
 
 //-----------------------------------------------------
 //	PREDECLARATIONs
@@ -81,17 +56,41 @@ typedef void (*StateFunc)();
 
 static StateFunc    state_funcs[] = { on_STARTUP,on_DRY, on_BOTTOM_LEVEL_SIGNALED,on_TOP_LEVEL_SIGNALED, on_DRAIN };
 
-/*
-static void toggle_warning(bool& warning, const char* message);
-static void start_drain_timer();
-static bool start_pumping(bool force = false);
-static void stop_pumping();
-static void drain();
-static void delay_pumping();
-static bool start_pumping(bool force = false);
-static void blink_green();
-static void set_next_drain_timer();
-*/
+#define set_state_id(id)  do {    \
+    if(id != gbl_state.state_id)    {\
+        gbl_state.state_id = id;    \
+        LOGGER << S("State set to ") << #id << NL;\
+        if(DRY > id)  StopTimer(last_drain_timer, LAST_DRAIN); } } while(0)
+
+#define DEFINE_SET_STATE_FUNC(id)   static void set_state_to_##id() { set_state_id(id); }
+
+DEFINE_SET_STATE_FUNC(DRY)
+DEFINE_SET_STATE_FUNC(BOTTOM_LEVEL_SIGNALED)
+DEFINE_SET_STATE_FUNC(TOP_LEVEL_SIGNALED)
+DEFINE_SET_STATE_FUNC(DRAIN)
+
+static void set_pumping(bool on)
+{
+    if(pump.SetAndLog(on, "PUMP"))
+    {
+        gbl_state.pumping = on;
+
+        pump_activity_signal_timer.Stop();
+
+        buzzer.Off();
+        led.SetOff();
+
+        if(on && (TOP == gbl_state.sensors_state))
+        {
+            buzzer.On();
+            led.GetRed().On();
+
+            return;
+        }
+
+        pump_activity_signal_timer.Start(1, SECS);
+    }
+}
 //--------------------------------------------------------------
 void setup()
 {
@@ -104,427 +103,203 @@ void setup()
 
 	pump.Off();
 
-	//drain_timer.StartOnce(1, MINS);
+    memzero(gbl_state);
 
-	//blink_green();
+    gbl_state.state_id       = STARTUP;
+    gbl_state.sensors_state  = NOT_SIGNALED;
+    gbl_state.pumping        = false;
+    gbl_state.sensor_failure = false;
+    gbl_state.simulation     = false;
 
-    UpdateSensorsState();
 	BuiltinLedToggler.StartOnOff(BuiltinLed, 1000);
 
-	LOGGER << "Ready" << NL;
+	LOGGER << S("Ready!") << NL;
 }
 //--------------------------------------------------------------
 void loop()
 {
+    delay(100);
+    
+    static State state = { (StateId)-1 };
+
+    if(!objequal(state, gbl_state))
+    {
+        state = gbl_state;
+        ShowState();
+    }
+
 	BuiltinLedToggler.Toggle();
+    WarningLedToggler.Toggle();
+
+    if(pump_activity_signal_timer.Test())
+    {
+        if(pump.IsOff())
+        {
+            buzzer.Off();
+            led.GetGreen().Toggle();
+        }
+        else
+        {
+            buzzer.Toggle();
+            led.GetRed().Toggle();
+        }
+    }
+
+    if(TestTimer(last_drain_timer, LAST_DRAIN))
+    {
+        set_state_to_DRAIN();
+    }
+
+    if(TestTimer(simulation_timer, SIMULATION))
+    {
+		MicroController::Restart();
+		return;
+    }
 
 	if (Serial.available())
+    {
 		treat_serial_input();
+    }
 
+    UpdateSensorsState();
     state_funcs[gbl_state.state_id]();
-}
-static void treat_serial_input()
-{
-
 }
 //--------------------------------------------------------------
 static void on_STARTUP()
 {
+    switch(gbl_state.sensors_state)
+    {
+        case NOT_SIGNALED:
+            set_state_to_DRAIN();
+            break;
 
+        case BOTTOM:
+            set_state_to_BOTTOM_LEVEL_SIGNALED();
+            break;
+
+        case TOP:
+            set_state_to_TOP_LEVEL_SIGNALED();
+            break;
+    }
 }
 //--------------------------------------------------------------
 static void on_DRY()
 {
+    set_pumping(false);
 
+    switch(gbl_state.sensors_state)
+    {
+        case NOT_SIGNALED:
+            break;
+
+        case BOTTOM:
+            set_state_to_BOTTOM_LEVEL_SIGNALED();
+            break;
+
+        case TOP:
+            set_state_to_TOP_LEVEL_SIGNALED();
+            break;
+    }
 }
 //--------------------------------------------------------------
 static void on_BOTTOM_LEVEL_SIGNALED()
 {
+    if(pump.IsOff())
+    {
+        set_pumping(true);
+        return;
+    }
 
+    switch(gbl_state.sensors_state)
+    {
+        case NOT_SIGNALED:
+            if(gbl_state.simulation)
+                StartTimer(last_drain_timer, LAST_DRAIN, 2, MINS );
+            else
+                StartTimer(last_drain_timer, LAST_DRAIN, 2, HOURS );
+
+            set_state_to_DRAIN();
+            break;
+
+        case BOTTOM:
+            break;
+
+        case TOP:
+            set_state_to_TOP_LEVEL_SIGNALED();
+            break;
+    }
 }
 //--------------------------------------------------------------
 static void on_TOP_LEVEL_SIGNALED()
 {
+    if(pump.IsOff())
+    {
+        set_pumping(true);
+        return;
+    }
 
+    if(TOP == gbl_state.sensors_state)
+        return;
+
+    set_state_to_BOTTOM_LEVEL_SIGNALED();
 }
 //--------------------------------------------------------------
 static void on_DRAIN()
 {
+    static Timer drain_timer;
+    static const char timer_name[] = "DRAIN";
 
-}
-//--------------------------------------------------------------
-//--------------------------------------------------------------
-/*
-void loop()
-{
-	BuiltinLedToggler.Toggle();
-
-    switch(gbl_state.state_id)
+    switch(gbl_state.sensors_state)
     {
-        #define TREATE_CASE()
-        case STARTUP:   
-            on_
+        case NOT_SIGNALED:
+            break;
+
+        case BOTTOM:
+            StopTimer(drain_timer, timer_name);
+            set_state_to_BOTTOM_LEVEL_SIGNALED();
+            return;
+
+        case TOP:
+            StopTimer(drain_timer, timer_name);
+            set_state_to_TOP_LEVEL_SIGNALED();
+            return;
     }
-/*
-	delay(10);
 
-	if (Serial.available())
-	{
-		treat_serial_input();
-	}
-
-	if (drain_timer.Test())
-	{
-		drain();
-	}
-
-	toggler.Toggle();
-	warning_toggler.Toggle();
-
-	// First get inputs
-	bool bottom_overflow, bottom_overflow_changed,
-		 top_overflow,	  top_overflow_changed;
-
-	bottom_overflow = bottom_level_observer.Get(&bottom_overflow_changed);
-	top_overflow	= top_level_observer.   Get(&top_overflow_changed);
-
-	if (bottom_overflow_changed)
-		LOGGER << "BL: " << bottom_overflow << NL;
-
-	if (top_overflow_changed)
-		LOGGER << "TL: " << top_overflow << NL;
-
-	bool overflow_changed = bottom_overflow_changed || top_overflow_changed;
-
-	// Check sensors
-	{
-		uint8_t bottom_level_sensor_count = _bottom_level_sensor.GetCount();
-		uint8_t top_level_sensor_count	  = _top_level_sensor.	 GetCount();
-
-		static bool bad_sensors = false;
-
-		if (top_level_sensor_count && (bottom_level_sensor_count < 3))
-		{
-			if (!bad_sensors)
-			{
-				toggle_warning(bad_sensors, "BAD sensors");
-				bad_sensors = true;
-			}
-		}
-		else
-		{
-			if (bad_sensors)
-			{
-				toggle_warning(bad_sensors, "Sensors OK");
-				bad_sensors = false;
-			}
-		}
-	}
-
-	static bool first_time = true;
-
-	if (!(first_time || overflow_changed))
-	{
-		// No input changes, so
-		// Check timers
-		bool change_pumping_state = pumping_timer.Test();
-
-		if (change_pumping_state)
-		{
-			if (pump.IsOn())
-			{
-				if (bottom_overflow)
-				{
-					delay_pumping();
-				}
-				else
-				{
-					stop_pumping();
-				}
-			}
-			else
-			{
-				start_pumping();
-			}
-		}
-
-		return;
-	}
-
-	first_time = false;
-
-	// Apply changes
-	int overflow_state = (int)bottom_overflow + ((int)top_overflow * 2);
-
-	switch (overflow_state)
-	{
-		case 0 :
-		{
-			stop_pumping();
-			break;
-		}
-
-		case 1:
-		{
-			// BOTTOM level overflow, TOP level is dry
-
-			if (bottom_overflow_changed)
-			{
-				// The water level goes up
-				delay_pumping();
-			}
-			else
-			{
-				// The water level goes down
-				start_pumping();
-			}
-
-			break;
-		}
-
-		case 2:
-		{
-			// TOP level overflow, BOTTOM level is dry
-			// Discrepancy
-			stop_pumping();
-			break;
-		}
-
-		case 3:
-		{
-			start_pumping();
-			break;
-		}
-	}
+    if(drain_timer.IsStarted())
+    {
+        if(TestTimer(drain_timer, timer_name))
+            set_state_to_DRY();
+    }
+    else
+    {
+        StartTimer(drain_timer, timer_name, 10, SECS);
+        set_pumping(true);
+    }
 }
 //--------------------------------------------------------------
-static void blink_green()
+void StartBlickingWarningLed()
 {
-	led.SetOff();
-	toggler.Start(led.GetGreen(), Toggler::OnTotal(300, 15000));
-}
-//--------------------------------------------------------------
-static void drain()
-{
-	if (pump.IsOff())
-	{
-		LOGGER << "Start drain" << NL;
-		pump.On();
-		enum { DRAIN_SECONDS = 10 };
-		drain_timer.StartOnce(DRAIN_SECONDS, SECS);
-	}
-	else
-	{
-		pump.Off();
-		LOGGER << "Stop drain" << NL;
-
-		if (drain_timer_delay_hours)
-		{
-			if (drain_timer_delay_hours == HOURS_PER_DAY)
-			{
-				drain_timer_delay_hours = 0;
-			}
-			else
-			{
-				drain_timer_delay_hours = HOURS_PER_DAY;
-				set_next_drain_timer();
-			}
-		}
-
-		blink_green();
-	}
-}
-//--------------------------------------------------------------
-static void cancel_drain()
-{
-	bool drain_timer_started = drain_timer.IsStarted();
-
-	if (!drain_timer_started)
-		return;
-
-	drain_timer.Stop();
-
-	if (pump.IsOn())
-	{
-		pump.Off();
-		LOGGER << "Drain pumping canceled" << NL;
-	}
-	else
-	{
-		LOGGER << "Drain timer stopped" << NL;
-	}
-}
-//--------------------------------------------------------------
-static void stop_pumping()
-{
-	bool is_pumping = pump.IsOn();
-	bool pumping_timer_is_started = pumping_timer.IsStarted();
-
-	pump.Off();
-	led.SetOff();
-	pumping_timer.Stop();
-
-	if (!bottom_level_observer.GetValue() && top_level_observer.GetValue())
-	{
-		LOGGER << "Sensor failure" << NL;
-		toggler.StartOnOff(pumping_signal, 500);
-	}
-	else
-	{
-		if(is_pumping)
-			LOGGER << "Pumping stopped" << NL;
-
-		blink_green();
-		start_drain_timer();
-	}
-}
-//--------------------------------------------------------------
-static void set_next_drain_timer()
-{
-	LOGGER << "Next drain in about " << drain_timer_delay_hours << " hour" << ((drain_timer_delay_hours == 1) ? "" : "s") << NL;
-	drain_timer.StartOnce(drain_timer_delay_hours, HOURS);
-}
-//--------------------------------------------------------------
-static void start_drain_timer()
-{
-	if (drain_timer.IsStarted())
-		return;
-
-	drain_timer_delay_hours = 1;
-	set_next_drain_timer();
-}
-//--------------------------------------------------------------
-static void delay_pumping()
-{
-	unsigned long delay_minutes = DELAY_MINUTES;
-
-	led.SetOff();
-
-	if (pump.IsOff())
-	{
-		LOGGER << "Pumping delay " << delay_minutes << "m" << NL;
-	}
-	else
-	{
-		pump.Off();
-		LOGGER << "Pumping paused for " << delay_minutes << "m" << NL;
-	}
-
-	cancel_drain();
-
-	pumping_timer.Stop();
-
-	pumping_timer.StartOnce(delay_minutes, MINS);
-
-	toggler.Start(led.GetRed(), Toggler::OnTotal(500, 10000));
-}
-//--------------------------------------------------------------
-static bool start_pumping(bool force = false)
-{
-	cancel_drain();
-
-	if (!bottom_level_observer.GetValue())
-		return false;
-
-	pump.On();
-	led.SetOff();
-
-	pumping_timer.Stop();
-
-	if (top_level_observer.GetValue())
-	{
-		LOGGER << "Start pumping" << NL;
-		toggler.StartOnOff(pumping_signal, 1, SECS);
-	}
-	else
-	{
-#if DRY_TEST
-		unsigned long delay_seconds = 5;
-
-		LOGGER << "Start pumping for max. " << delay_seconds << "s" << NL;
-
-		pumping_timer.StartOnce(delay_seconds, SECS);
-		toggler.StartOnOff(pumping_signal, 1, SECS);
-#else
-		unsigned long delay_minutes = DELAY_MINUTES;
-
-		LOGGER << "Start pumping for max. " << delay_minutes << "m" << NL;
-
-		pumping_timer.StartOnce(delay_minutes, MINS);
-		toggler.Start(pumping_signal, Toggler::OnTotal(1, 5), SECS);
-#endif
-	}
-
-	return true;
-}
-//--------------------------------------------------------------
-static void toggle_warning(bool& warning, const char* message)
-{
-	static int warnings_count = 0;
-	
-	warning = !warning;
-	warnings_count += (warning) ? 1 : -1;
-
-	warning_toggler.Stop();
-
-	if(message)
-		LOGGER << F("WARN: ") << message << NL;
-
-	if(!warnings_count)
-		return;
-
-	unsigned long*	on_off_array;
-	uint16_t		on_off_array_count;
-
-	switch (warnings_count)
-	{
-		case 1:
-		{
-			static unsigned long a[] = { 500, 4500 };
-			on_off_array = a;
-			on_off_array_count = countof(a);
-
-			break;
-		}
-
-		case 2:
-		{
-			static unsigned long a[] = { 400, 400, 400, 3800 };
-			on_off_array = a;
-			on_off_array_count = countof(a);
-
-			break;
-		}
-
-		case 3:
-		{
-			static unsigned long a[] = { 300, 300, 300, 300, 300, 3500 };
-			on_off_array = a;
-			on_off_array_count = countof(a);
-
-			break;
-		}
-
-		default:
-		{
-			static unsigned long a[] = { 300, 300 };
-			on_off_array = a;
-			on_off_array_count = countof(a);
-
-			break;
-		}
-
-	}
-
-	warning_toggler.Start(warning_led, on_off_array, on_off_array_count);
+    if(WarningLedToggler.IsStarted())
+    {
+        return;
+    }
+        
+	WarningLedToggler.StartOnOff(warning_led, 200);
 }
 //--------------------------------------------------------------
 static void treat_serial_input()
 {
 	String s = Serial.readString();
 
-	LOGGER << "Command '" << s << "' got from serial" << NL;
+    s.trim();
 
+    if(s.length() == 0)
+        return;
+
+	LOGGER << S("Command '") << s << S("' got from serial") << NL;
+
+    s.toUpperCase();
+    
 	if (s == "RESTART")
 	{
 		MicroController::Restart();
@@ -543,8 +318,118 @@ static void treat_serial_input()
 		return;
 	}
 
+	if (s == "SIM")
+	{
+		gbl_state.simulation = true;
+        StartTimer(simulation_timer, SIMULATION, 30, MINS);
+        ResetSimulationValues();
+		return;
+	}
+/*
+	if (s == "NOSIM")
+	{
+		gbl_state.simulation = false;
+        simulation_timer.Stop();
+        gbl_state.sensor_failure = false;
+		return;
+	}
+*/
+    if(OnSensorsCommand(s))
+    {
+        return;
+    }
+
 	Serial.println("Unknown command");
 }
+//------------------------------------------------------------------------------------------
+static void show_state_field(const char* name, const bool& value, bool onoff)
+{
+    _LOGGER << S("    ") << name << S(": ");
+    
+    if(onoff)   _LOGGER     << ONOFF(value).Get()   << NL;
+    else        _LOGGER     << value                << NL;
+}
+//------------------------------------------------------------------------------------------
+template <class T>
+static void show_state_field(const char* name, const T& value)
+{
+    _LOGGER << S("    ") << name << S(": ") << value << NL;
+}
 //--------------------------------------------------------------
+static const char* GetStateIdName()
+{
+    switch(gbl_state.state_id)
+    {
+        #define TREATE_CASE(id) case id: return #id
+        TREATE_CASE(STARTUP);
+        TREATE_CASE(DRY);
+        TREATE_CASE(BOTTOM_LEVEL_SIGNALED);
+        TREATE_CASE(TOP_LEVEL_SIGNALED);
+        TREATE_CASE(DRAIN);
+        #undef TREATE_CASE
+    }
 
-*/
+    return "?";
+}
+//--------------------------------------------------------------
+static const char* GetSensorsStateName()
+{
+    switch(gbl_state.sensors_state)
+    {
+        #define TREATE_CASE(id) case id: return #id
+        TREATE_CASE(NOT_SIGNALED);
+        TREATE_CASE(BOTTOM);
+        TREATE_CASE(TOP);
+        #undef TREATE_CASE
+    }
+
+    return "?";
+}
+//--------------------------------------------------------------
+void ShowState()
+{
+    _LOGGER << S("Status: ") << NL;
+
+    #define SHOW_BOOL_FLD(fld)     show_state_field( #fld, gbl_state.fld, false )
+    #define SHOW_ONOFF_FLD(fld)    show_state_field( #fld, gbl_state.fld, true )
+    #define SHOW_FLD(fld)          show_state_field( #fld, gbl_state.fld )
+
+    show_state_field("state_id",        GetStateIdName());
+    show_state_field("sensors_state",   GetSensorsStateName());
+    show_state_field("sensors",         GetSensorsStates());
+    SHOW_ONOFF_FLD(pumping);
+    SHOW_BOOL_FLD(sensor_failure);
+    SHOW_ONOFF_FLD(simulation);
+}
+//--------------------------------------------------------------
+void StartTimer(Timer& t, const char* timer_name, unsigned long delay, TimeUnit unit)
+{
+    if(t.IsStarted())
+        return;
+
+    t.StartOnce(delay, unit);
+
+    LOGGER << timer_name << S(" timer started for ") << delay << S(" ") << GetTimeUnitName(unit) << NL;
+}
+//--------------------------------------------------------------
+void StopTimer(Timer& t, const char* timer_name)
+{
+    if(!t.IsStarted())
+        return;
+
+    t.Stop();
+
+    LOGGER << timer_name << S(" timer stopped") << NL;
+}
+//--------------------------------------------------------------
+bool TestTimer(Timer& t, const char* timer_name)
+{
+    if(t.Test())
+    {
+        LOGGER << timer_name << S(" timer timed-out") << NL;
+        return true;
+    }
+
+    return false;
+}
+//--------------------------------------------------------------

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "NYG.h"
+#include "Timer.h"
 
 //-----------------------------------------------------
 //	Pin numbers
@@ -39,10 +40,20 @@ struct State
 {
     StateId         state_id;
     SensorsState    sensors_state;
+    bool            sensor_failure;
     bool            pumping;
+    bool            simulation;
 };
 
 extern State gbl_state;
 
 void UpdateSensorsState();
+void StartBlickingWarningLed();
+void ShowState();
+bool OnSensorsCommand(const String& s);
+String GetSensorsStates();
+void ResetSimulationValues();
 
+void StartTimer(Timer& t, const char* timer_name, unsigned long delay, TimeUnit unit);
+void StopTimer(Timer& t, const char* timer_name);
+bool TestTimer(Timer& t, const char* timer_name);
