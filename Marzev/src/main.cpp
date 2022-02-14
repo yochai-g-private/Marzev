@@ -38,7 +38,8 @@ DECLARE_TIMER_NAME(SIMULATION);
 
 DigitalOutputPin			BuiltinLed(LED_BUILTIN);
 static Toggler				BuiltinLedToggler;
-static Toggler				WarningLedToggler;	// used to toggle the warning led
+static Toggler				WarningLedToggler;	    // used to toggle the warning led
+static Toggler				WarningBuzzerToggler;	// used to toggle the warning buzzer
 
 
 //-----------------------------------------------------
@@ -54,12 +55,16 @@ static void on_DRAIN();
 
 typedef void (*StateFunc)();
 
+static void set_pump_activity_signal();
+static void set_pumping(bool on);
+
 static StateFunc    state_funcs[] = { on_STARTUP,on_DRY, on_BOTTOM_LEVEL_SIGNALED,on_TOP_LEVEL_SIGNALED, on_DRAIN };
 
 #define set_state_id(id)  do {    \
     if(id != gbl_state.state_id)    {\
         gbl_state.state_id = id;    \
         LOGGER << S("State set to ") << #id << NL;\
+        set_pump_activity_signal();\
         if(DRY > id)  StopTimer(last_drain_timer, LAST_DRAIN); } } while(0)
 
 #define DEFINE_SET_STATE_FUNC(id)   static void set_state_to_##id() { set_state_id(id); }
@@ -69,28 +74,6 @@ DEFINE_SET_STATE_FUNC(BOTTOM_LEVEL_SIGNALED)
 DEFINE_SET_STATE_FUNC(TOP_LEVEL_SIGNALED)
 DEFINE_SET_STATE_FUNC(DRAIN)
 
-static void set_pumping(bool on)
-{
-    if(pump.SetAndLog(on, "PUMP"))
-    {
-        gbl_state.pumping = on;
-
-        pump_activity_signal_timer.Stop();
-
-        buzzer.Off();
-        led.SetOff();
-
-        if(on && (TOP == gbl_state.sensors_state))
-        {
-            buzzer.On();
-            led.GetRed().On();
-
-            return;
-        }
-
-        pump_activity_signal_timer.Start(1, SECS);
-    }
-}
 //--------------------------------------------------------------
 void setup()
 {
@@ -119,7 +102,7 @@ void setup()
 void loop()
 {
     delay(100);
-    
+
     static State state = { (StateId)-1 };
 
     if(!objequal(state, gbl_state))
@@ -130,10 +113,11 @@ void loop()
 
 	BuiltinLedToggler.Toggle();
     WarningLedToggler.Toggle();
+    WarningBuzzerToggler.Toggle();
 
     if(pump_activity_signal_timer.Test())
     {
-        if(pump.IsOff())
+        if(DRY == gbl_state.state_id)
         {
             buzzer.Off();
             led.GetGreen().Toggle();
@@ -285,6 +269,7 @@ void StartBlickingWarningLed()
     }
         
 	WarningLedToggler.StartOnOff(warning_led, 200);
+    WarningBuzzerToggler.Start(buzzer, Toggler::OnTotal(200, 10000));
 }
 //--------------------------------------------------------------
 static void treat_serial_input()
@@ -325,15 +310,7 @@ static void treat_serial_input()
         ResetSimulationValues();
 		return;
 	}
-/*
-	if (s == "NOSIM")
-	{
-		gbl_state.simulation = false;
-        simulation_timer.Stop();
-        gbl_state.sensor_failure = false;
-		return;
-	}
-*/
+
     if(OnSensorsCommand(s))
     {
         return;
@@ -431,5 +408,34 @@ bool TestTimer(Timer& t, const char* timer_name)
     }
 
     return false;
+}
+//--------------------------------------------------------------
+static void set_pump_activity_signal()
+{
+    pump_activity_signal_timer.Stop();
+
+    buzzer.Off();
+    led.SetOff();
+
+    switch(gbl_state.state_id)
+    {
+        case DRY:
+        case DRAIN:
+        case BOTTOM_LEVEL_SIGNALED:
+            pump_activity_signal_timer.StartForever(1, SECS);
+            break;
+        case TOP_LEVEL_SIGNALED:
+            buzzer.On();
+            led.GetRed().On();
+            break;
+    }
+}
+//--------------------------------------------------------------
+static void set_pumping(bool on)
+{
+    if(pump.SetAndLog(on, "PUMP"))
+    {
+        gbl_state.pumping = on;
+    }
 }
 //--------------------------------------------------------------
