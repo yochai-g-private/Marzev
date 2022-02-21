@@ -53,10 +53,10 @@ static void on_BOTTOM_LEVEL_SIGNALED();
 static void on_TOP_LEVEL_SIGNALED();
 static void on_DRAIN();
 
-typedef void (*StateFunc)();
-
 static void set_pump_activity_signal();
 static void set_pumping(bool on);
+
+typedef void (*StateFunc)();
 
 static StateFunc    state_funcs[] = { on_STARTUP,on_DRY, on_BOTTOM_LEVEL_SIGNALED,on_TOP_LEVEL_SIGNALED, on_DRAIN };
 
