@@ -3,7 +3,7 @@
 set ProjectDir=%~dp0
 set Lib=%ProjectDir%lib\
 
-set Libraries=C:\Users\yochai.glauber\Documents\Arduino\Libraries\
+set Libraries=%USERPROFILE%\Documents\Arduino\Libraries\
 
 ::============================================
 :: Create links
